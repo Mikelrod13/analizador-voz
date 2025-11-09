@@ -1,0 +1,509 @@
+"""
+API REST PARA SISTEMA DE ANÁLISIS EMOCIONAL
+Servidor Flask que conecta el análisis de voz con la interfaz React
+Autor: Miguel Rodríguez León
+"""
+
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+import threading
+import time
+import json
+import os
+from datetime import datetime
+import logging
+from collections import deque
+import numpy as np
+
+# Importar el analizador (asumiendo que está en el mismo directorio)
+try:
+    from voice_analyzer import EmotionalVoiceAnalyzer
+except ImportError:
+    print("⚠️ voice_analyzer.py no encontrado. Usando modo simulación.")
+    EmotionalVoiceAnalyzer = None
+
+# Configuración de Flask
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'cabinas-anti-suicidio-2025'
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('cabin_system.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Variables globales
+analyzer = None
+current_session = None
+is_analyzing = False
+analysis_thread = None
+session_history = deque(maxlen=100)
+
+# Crear directorios necesarios
+os.makedirs('data/sessions', exist_ok=True)
+os.makedirs('data/incidents', exist_ok=True)
+os.makedirs('logs', exist_ok=True)
+
+
+class SessionManager:
+    """Gestiona las sesiones de usuario en la cabina."""
+    
+    def __init__(self):
+        self.session_id = None
+        self.start_time = None
+        self.states_history = []
+        self.emergency_triggered = False
+        self.chat_messages = []
+    
+    def start_session(self):
+        """Inicia una nueva sesión."""
+        self.session_id = f"session_{int(time.time())}"
+        self.start_time = datetime.now()
+        self.states_history = []
+        self.emergency_triggered = False
+        self.chat_messages = []
+        
+        logger.info(f"✓ Nueva sesión iniciada: {self.session_id}")
+        return self.session_id
+    
+    def add_state(self, state_data):
+        """Agrega un estado emocional al historial."""
+        state_data['timestamp'] = datetime.now().isoformat()
+        self.states_history.append(state_data)
+        
+        # Verificar si necesita intervención
+        if state_data.get('risk_level') == 'critico':
+            self.trigger_emergency(state_data)
+    
+    def trigger_emergency(self, state_data):
+        """Activa el protocolo de emergencia."""
+        if not self.emergency_triggered:
+            self.emergency_triggered = True
+            
+            incident = {
+                'incident_id': f"INC_{int(time.time())}",
+                'session_id': self.session_id,
+                'timestamp': datetime.now().isoformat(),
+                'state_data': state_data,
+                'action_taken': 'emergency_protocol_activated',
+                'status': 'active'
+            }
+            
+            # Guardar incidente
+            incident_file = f"data/incidents/{incident['incident_id']}.json"
+            with open(incident_file, 'w') as f:
+                json.dump(incident, f, indent=2, ensure_ascii=False)
+            
+            logger.critical(f"🚨 EMERGENCIA ACTIVADA: {incident['incident_id']}")
+            
+            # Emitir evento a través de WebSocket
+            socketio.emit('emergency_alert', incident)
+            
+            return incident
+    
+    def add_chat_message(self, message_type, content):
+        """Agrega un mensaje al chat."""
+        message = {
+            'type': message_type,
+            'content': content,
+            'timestamp': datetime.now().isoformat()
+        }
+        self.chat_messages.append(message)
+        return message
+    
+    def end_session(self):
+        """Finaliza la sesión y guarda los datos."""
+        if not self.session_id:
+            return None
+        
+        end_time = datetime.now()
+        duration = (end_time - self.start_time).total_seconds()
+        
+        session_data = {
+            'session_id': self.session_id,
+            'start_time': self.start_time.isoformat(),
+            'end_time': end_time.isoformat(),
+            'duration_seconds': duration,
+            'states_count': len(self.states_history),
+            'states_history': self.states_history,
+            'emergency_triggered': self.emergency_triggered,
+            'chat_messages': self.chat_messages,
+            'summary': self._generate_summary()
+        }
+        
+        # Guardar sesión
+        session_file = f"data/sessions/{self.session_id}.json"
+        with open(session_file, 'w') as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"✓ Sesión finalizada: {self.session_id} (duración: {duration:.0f}s)")
+        
+        # Limpiar
+        self.session_id = None
+        return session_data
+    
+    def _generate_summary(self):
+        """Genera un resumen de la sesión."""
+        if not self.states_history:
+            return {'status': 'no_data'}
+        
+        emotions = [s.get('emotion', 'neutral') for s in self.states_history]
+        risks = [s.get('risk_level', 'normal') for s in self.states_history]
+        
+        from collections import Counter
+        emotion_counts = Counter(emotions)
+        risk_counts = Counter(risks)
+        
+        return {
+            'dominant_emotion': emotion_counts.most_common(1)[0][0],
+            'emotion_distribution': dict(emotion_counts),
+            'max_risk_level': max(risks, key=lambda x: ['normal', 'medio', 'alto', 'critico'].index(x)),
+            'risk_distribution': dict(risk_counts),
+            'total_analyses': len(self.states_history)
+        }
+
+
+def continuous_analysis_loop():
+    """Loop principal de análisis continuo."""
+    global is_analyzing, current_session, analyzer
+    
+    logger.info("🎤 Análisis continuo iniciado")
+    
+    while is_analyzing:
+        try:
+            if analyzer and EmotionalVoiceAnalyzer:
+                # Análisis real con micrófono
+                audio = analyzer.record_audio_segment()
+                features = analyzer.extract_features(audio)
+                
+                if features:
+                    emotion, risk, confidence, explanation = analyzer.classify_emotion(features)
+                    
+                    state_data = {
+                        'emotion': emotion,
+                        'risk_level': risk,
+                        'confidence': round(confidence, 2),
+                        'explanation': explanation,
+                        'features': {
+                            'volume': round(features['volume_mean'], 3),
+                            'pitch': round(features['pitch_mean'], 1),
+                            'tempo': round(features['tempo'], 1),
+                            'pause_duration': round(features['avg_pause_duration'], 2),
+                            'speech_ratio': round(features['speech_ratio'], 2)
+                        }
+                    }
+                else:
+                    state_data = {'emotion': 'neutral', 'risk_level': 'normal', 'confidence': 0}
+            else:
+                # Modo simulación (para pruebas sin micrófono)
+                emotions = ['neutral', 'estable', 'tristeza', 'ansiedad', 'depresion']
+                risks = ['normal', 'normal', 'medio', 'medio', 'alto']
+                idx = np.random.randint(0, len(emotions))
+                
+                state_data = {
+                    'emotion': emotions[idx],
+                    'risk_level': risks[idx],
+                    'confidence': round(np.random.uniform(0.6, 0.95), 2),
+                    'explanation': 'Análisis simulado (modo demo)',
+                    'features': {
+                        'volume': round(np.random.uniform(0.02, 0.15), 3),
+                        'pitch': round(np.random.uniform(120, 280), 1),
+                        'tempo': round(np.random.uniform(90, 180), 1),
+                        'pause_duration': round(np.random.uniform(0.5, 2.5), 2),
+                        'speech_ratio': round(np.random.uniform(0.4, 0.9), 2)
+                    }
+                }
+            
+            # Agregar a la sesión actual
+            if current_session:
+                current_session.add_state(state_data)
+            
+            # Emitir actualización por WebSocket
+            socketio.emit('state_update', state_data)
+            
+            # Pausa entre análisis
+            time.sleep(2)
+            
+        except Exception as e:
+            logger.error(f"Error en análisis continuo: {e}")
+            time.sleep(1)
+    
+    logger.info("🎤 Análisis continuo detenido")
+
+
+# ============================================================================
+# RUTAS DE LA API
+# ============================================================================
+
+@app.route('/')
+def index():
+    """Página de inicio."""
+    return jsonify({
+        'service': 'Cabinas Anti-suicidio - API',
+        'version': '1.0',
+        'status': 'online',
+        'endpoints': {
+            'session': '/api/session/*',
+            'analysis': '/api/analysis/*',
+            'emergency': '/api/emergency',
+            'chat': '/api/chat',
+            'stats': '/api/stats'
+        }
+    })
+
+
+@app.route('/api/session/start', methods=['POST'])
+def start_session():
+    """Inicia una nueva sesión."""
+    global current_session, is_analyzing, analysis_thread, analyzer
+    
+    try:
+        # Crear nueva sesión
+        current_session = SessionManager()
+        session_id = current_session.start_session()
+        
+        # Inicializar analizador si existe
+        if EmotionalVoiceAnalyzer and not analyzer:
+            analyzer = EmotionalVoiceAnalyzer(duration=3)
+        
+        # Iniciar análisis continuo
+        if not is_analyzing:
+            is_analyzing = True
+            analysis_thread = threading.Thread(target=continuous_analysis_loop)
+            analysis_thread.daemon = True
+            analysis_thread.start()
+        
+        return jsonify({
+            'status': 'success',
+            'session_id': session_id,
+            'message': 'Sesión iniciada correctamente'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error al iniciar sesión: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/session/end', methods=['POST'])
+def end_session():
+    """Finaliza la sesión actual."""
+    global current_session, is_analyzing
+    
+    try:
+        if not current_session:
+            return jsonify({'status': 'error', 'message': 'No hay sesión activa'}), 400
+        
+        # Detener análisis
+        is_analyzing = False
+        time.sleep(1)  # Esperar a que termine el loop
+        
+        # Guardar y finalizar sesión
+        session_data = current_session.end_session()
+        current_session = None
+        
+        return jsonify({
+            'status': 'success',
+            'session_data': session_data,
+            'message': 'Sesión finalizada correctamente'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error al finalizar sesión: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/analysis/state', methods=['GET'])
+def get_current_state():
+    """Obtiene el estado emocional actual."""
+    if not current_session or not current_session.states_history:
+        return jsonify({
+            'emotion': 'neutral',
+            'risk_level': 'normal',
+            'confidence': 0,
+            'message': 'Sin datos disponibles'
+        })
+    
+    # Retornar el último estado
+    latest_state = current_session.states_history[-1]
+    return jsonify(latest_state)
+
+
+@app.route('/api/analysis/history', methods=['GET'])
+def get_analysis_history():
+    """Obtiene el historial de análisis de la sesión."""
+    if not current_session:
+        return jsonify({'status': 'error', 'message': 'No hay sesión activa'}), 400
+    
+    return jsonify({
+        'session_id': current_session.session_id,
+        'states_count': len(current_session.states_history),
+        'history': current_session.states_history[-20:]  # Últimos 20
+    })
+
+
+@app.route('/api/emergency', methods=['POST'])
+def trigger_emergency():
+    """Activa el protocolo de emergencia manualmente."""
+    if not current_session:
+        return jsonify({'status': 'error', 'message': 'No hay sesión activa'}), 400
+    
+    try:
+        # Obtener último estado o crear uno de emergencia
+        if current_session.states_history:
+            last_state = current_session.states_history[-1]
+        else:
+            last_state = {
+                'emotion': 'crisis',
+                'risk_level': 'critico',
+                'confidence': 1.0,
+                'explanation': 'Activación manual de emergencia'
+            }
+        
+        incident = current_session.trigger_emergency(last_state)
+        
+        # Aquí se integraría con Twilio (siguiente paso)
+        logger.critical(f"🚨 EMERGENCIA MANUAL: {incident['incident_id']}")
+        
+        return jsonify({
+            'status': 'success',
+            'incident': incident,
+            'action': 'emergency_protocol_activated',
+            'next_steps': [
+                'Llamada a línea de crisis iniciada',
+                'Supervisor notificado',
+                'Ubicación compartida',
+                'Registro de incidente creado'
+            ]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error al activar emergencia: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/chat', methods=['POST'])
+def chat_message():
+    """Procesa mensajes del chat."""
+    if not current_session:
+        return jsonify({'status': 'error', 'message': 'No hay sesión activa'}), 400
+    
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        
+        if not user_message:
+            return jsonify({'status': 'error', 'message': 'Mensaje vacío'}), 400
+        
+        # Guardar mensaje del usuario
+        current_session.add_chat_message('user', user_message)
+        
+        # Generar respuesta (aquí se integraría Claude API - siguiente paso)
+        # Por ahora, respuesta simple basada en estado emocional
+        if current_session.states_history:
+            emotion = current_session.states_history[-1].get('emotion', 'neutral')
+        else:
+            emotion = 'neutral'
+        
+        responses = {
+            'ansiedad': 'Entiendo que te sientes ansioso. Tu respiración puede ayudarte. ¿Quieres hacer un ejercicio de respiración?',
+            'tristeza': 'Está bien sentirse triste. Tus emociones son válidas. ¿Quieres hablar sobre lo que sientes?',
+            'depresion': 'Entiendo que te sientes abrumado. No estás solo. ¿Hay algo específico que te preocupa ahora?',
+            'crisis': 'Escucho que estás pasando por un momento muy difícil. Hay personas disponibles para ayudarte ahora mismo. ¿Puedo conectarte con alguien?',
+            'neutral': 'Te escucho. Cuéntame más sobre eso.'
+        }
+        
+        bot_response = responses.get(emotion, responses['neutral'])
+        current_session.add_chat_message('bot', bot_response)
+        
+        return jsonify({
+            'status': 'success',
+            'response': bot_response,
+            'emotion_detected': emotion
+        })
+        
+    except Exception as e:
+        logger.error(f"Error en chat: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/stats', methods=['GET'])
+def get_statistics():
+    """Obtiene estadísticas del sistema."""
+    try:
+        # Contar sesiones
+        sessions_dir = 'data/sessions'
+        incidents_dir = 'data/incidents'
+        
+        sessions = len([f for f in os.listdir(sessions_dir) if f.endswith('.json')]) if os.path.exists(sessions_dir) else 0
+        incidents = len([f for f in os.listdir(incidents_dir) if f.endswith('.json')]) if os.path.exists(incidents_dir) else 0
+        
+        # Estado actual
+        current_status = {
+            'active_session': current_session.session_id if current_session else None,
+            'analyzing': is_analyzing,
+            'analyzer_available': EmotionalVoiceAnalyzer is not None
+        }
+        
+        return jsonify({
+            'total_sessions': sessions,
+            'total_incidents': incidents,
+            'current_status': current_status,
+            'uptime': 'Sistema operativo'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error al obtener estadísticas: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================================================================
+# WEBSOCKET EVENTS (Comunicación en tiempo real)
+# ============================================================================
+
+@socketio.on('connect')
+def handle_connect():
+    """Cliente conectado."""
+    logger.info(f"✓ Cliente conectado: {request.sid}")
+    emit('connected', {'message': 'Conectado al servidor'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Cliente desconectado."""
+    logger.info(f"✗ Cliente desconectado: {request.sid}")
+
+
+@socketio.on('request_state')
+def handle_state_request():
+    """Cliente solicita el estado actual."""
+    if current_session and current_session.states_history:
+        emit('state_update', current_session.states_history[-1])
+
+
+# ============================================================================
+# INICIO DEL SERVIDOR
+# ============================================================================
+
+if __name__ == '__main__':
+    print("""
+    ╔══════════════════════════════════════════════════════════╗
+    ║        API SERVIDOR - CABINAS ANTI-SUICIDIO              ║
+    ║                                                          ║
+    ║  Puerto: 5000                                            ║
+    ║  WebSocket: Activado                                     ║
+    ║  CORS: Habilitado                                        ║
+    ╚══════════════════════════════════════════════════════════╝
+    """)
+    
+    logger.info("🚀 Servidor iniciado en http://0.0.0.0:5000")
+    
+    # Iniciar servidor con WebSocket
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
